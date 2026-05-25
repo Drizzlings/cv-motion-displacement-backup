@@ -24,6 +24,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.yaml"
 class Detection:
     center: Point
     bbox: Tuple[int, int, int, int]
+    quad: np.ndarray
     points: Optional[np.ndarray] = None
 
 
@@ -286,19 +287,131 @@ def clamp_roi(roi: Sequence[int], width: int, height: int) -> Tuple[int, int, in
     return x, y, w, h
 
 
-def detect_features_in_roi(gray: np.ndarray, roi: Tuple[int, int, int, int], config: dict) -> Optional[np.ndarray]:
+def roi_to_quad(roi: Tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = roi
+    return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
+
+
+def quad_center(quad: np.ndarray) -> Point:
+    center = np.asarray(quad, dtype=np.float32).reshape(4, 2).mean(axis=0)
+    return float(center[0]), float(center[1])
+
+
+def bbox_from_quad(quad: np.ndarray, width: int, height: int) -> Tuple[int, int, int, int]:
+    pts = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    x, y, w, h = cv2.boundingRect(pts.astype(np.float32))
+    x, y, w, h = clamp_roi((x, y, w, h), width, height)
+    return x, y, w, h
+
+
+def quad_is_reasonable(quad: np.ndarray, width: int, height: int, initial_area: float, config: dict) -> bool:
+    pts = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    if not np.isfinite(pts).all():
+        return False
+    if (pts[:, 0] < -width * 0.25).any() or (pts[:, 0] > width * 1.25).any():
+        return False
+    if (pts[:, 1] < -height * 0.25).any() or (pts[:, 1] > height * 1.25).any():
+        return False
+    area = abs(cv2.contourArea(pts))
+    min_scale = float(config["optical_flow"].get("min_quad_area_scale", 0.25))
+    max_scale = float(config["optical_flow"].get("max_quad_area_scale", 4.0))
+    return initial_area * min_scale <= area <= initial_area * max_scale
+
+
+def make_quad_mask(shape: Tuple[int, int], quad: np.ndarray) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.asarray(quad, dtype=np.int32).reshape(4, 2), 255)
+    return mask
+
+
+def detect_features_in_quad(gray: np.ndarray, quad: np.ndarray, config: dict) -> Optional[np.ndarray]:
+    quad_pts = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    grid_size = int(config["optical_flow"].get("grid_size", 5))
+    grid_values = np.linspace(0.12, 0.88, max(2, grid_size))
+    grid_points = []
+    for v in grid_values:
+        left = (1.0 - v) * quad_pts[0] + v * quad_pts[3]
+        right = (1.0 - v) * quad_pts[1] + v * quad_pts[2]
+        for u in grid_values:
+            grid_points.append((1.0 - u) * left + u * right)
+    grid_points = np.asarray(grid_points, dtype=np.float32)
+    edge_midpoints = np.array(
+        [
+            (quad_pts[0] + quad_pts[1]) / 2.0,
+            (quad_pts[1] + quad_pts[2]) / 2.0,
+            (quad_pts[2] + quad_pts[3]) / 2.0,
+            (quad_pts[3] + quad_pts[0]) / 2.0,
+            quad_pts.mean(axis=0),
+        ],
+        dtype=np.float32,
+    )
+    anchor_points = np.vstack([quad_pts, edge_midpoints, grid_points])
+
+    mask = make_quad_mask(gray.shape, quad)
+    features = cv2.goodFeaturesToTrack(gray, mask=mask, **get_feature_params(config))
+    if features is not None and len(features) >= 2:
+        # Keep tracked points dominated by the manually selected ROI geometry.
+        # Shi-Tomasi points are only supplementary and are clipped to avoid background texture taking over.
+        max_extra = max(0, int(config["optical_flow"].get("max_corners", 80)) - len(anchor_points))
+        merged = np.vstack([anchor_points, features.reshape(-1, 2)[:max_extra]])
+        return merged.reshape(-1, 1, 2).astype(np.float32)
+
+    x, y, w, h = cv2.boundingRect(np.asarray(quad, dtype=np.float32))
+    x, y, w, h = clamp_roi((x, y, w, h), gray.shape[1], gray.shape[0])
     mask = np.zeros_like(gray)
     mask[y : y + h, x : x + w] = 255
     features = cv2.goodFeaturesToTrack(gray, mask=mask, **get_feature_params(config))
     if features is not None and len(features) >= 2:
-        return features.astype(np.float32)
+        max_extra = max(0, int(config["optical_flow"].get("max_corners", 80)) - len(anchor_points))
+        merged = np.vstack([anchor_points, features.reshape(-1, 2)[:max_extra]])
+        return merged.reshape(-1, 1, 2).astype(np.float32)
 
     # Fallback grid points still feed the LK tracker, but do not use color or thresholding.
     xs = np.linspace(x + w * 0.25, x + w * 0.75, 3)
     ys = np.linspace(y + h * 0.25, y + h * 0.75, 3)
     grid = np.array([[[px, py]] for py in ys for px in xs], dtype=np.float32)
-    return grid
+    merged = np.vstack([anchor_points, grid.reshape(-1, 2)])
+    return merged.reshape(-1, 1, 2).astype(np.float32)
+
+
+def template_score_at_quad(image: np.ndarray, template: np.ndarray, quad: np.ndarray) -> float:
+    x, y, w, h = cv2.boundingRect(np.asarray(quad, dtype=np.float32))
+    x, y, w, h = clamp_roi((x, y, w, h), image.shape[1], image.shape[0])
+    if w < 5 or h < 5:
+        return -1.0
+    patch = image[y : y + h, x : x + w]
+    patch = cv2.resize(patch, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_LINEAR)
+    result = cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED)
+    return float(result[0, 0])
+
+
+def reacquire_quad_by_template(image: np.ndarray, template: np.ndarray, init_roi: Tuple[int, int, int, int]) -> Tuple[Optional[np.ndarray], float]:
+    if image.shape[0] < template.shape[0] or image.shape[1] < template.shape[1]:
+        return None, -1.0
+    result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+    _, best_score, _, best_loc = cv2.minMaxLoc(result)
+    x, y = best_loc
+    _ix, _iy, w, h = init_roi
+    return roi_to_quad((x, y, w, h)), float(best_score)
+
+
+def maybe_reacquire_quad(
+    image: np.ndarray,
+    template: np.ndarray,
+    quad: np.ndarray,
+    init_roi: Tuple[int, int, int, int],
+    config: dict,
+) -> Tuple[np.ndarray, bool]:
+    if not bool(config["optical_flow"].get("template_reacquire", True)):
+        return quad, False
+    threshold = float(config["optical_flow"].get("template_match_threshold", 0.55))
+    current_score = template_score_at_quad(image, template, quad)
+    if current_score >= threshold:
+        return quad, False
+    reacquired, best_score = reacquire_quad_by_template(image, template, init_roi)
+    if reacquired is not None and best_score >= threshold:
+        return reacquired.astype(np.float32), True
+    return quad, False
 
 
 def track_target_with_optical_flow(video_path: Path, config: dict) -> Tuple[List[Optional[Detection]], List[Optional[Point]]]:
@@ -313,22 +426,34 @@ def track_target_with_optical_flow(video_path: Path, config: dict) -> Tuple[List
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     init_frame_index = int(config["optical_flow"].get("init_frame_index", 0))
     init_roi = clamp_roi(rois[video_path.name], width, height)
-    init_center = (init_roi[0] + init_roi[2] / 2.0, init_roi[1] + init_roi[3] / 2.0)
+    quad: Optional[np.ndarray] = roi_to_quad(init_roi)
+    initial_area = abs(cv2.contourArea(quad))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, init_frame_index)
+    ok_template, template_frame = cap.read()
+    if not ok_template:
+        raise RuntimeError(f"failed to read template frame for {video_path.name}")
+    tx, ty, tw, th = init_roi
+    template_match_frame = cv2.cvtColor(template_frame, cv2.COLOR_BGR2LAB)[:, :, 1:3]
+    template = template_match_frame[ty : ty + th, tx : tx + tw].copy()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     min_tracks = int(config["optical_flow"].get("min_tracks", 6))
+    min_inliers = int(config["optical_flow"].get("min_inliers", 4))
     fb_limit = float(config["optical_flow"].get("max_forward_backward_error", 2.0))
     max_center_jump = float(config["optical_flow"].get("max_center_jump_px", 80.0))
+    ransac_threshold = float(config["optical_flow"].get("ransac_reproj_threshold", 4.0))
+    template_check_interval = int(config["optical_flow"].get("template_check_interval", 3))
 
     detections: List[Optional[Detection]] = []
     centers: List[Optional[Point]] = []
     prev_gray: Optional[np.ndarray] = None
     points: Optional[np.ndarray] = None
-    center: Optional[Point] = None
 
     for frame_index in range(frame_count):
         ok, frame = cap.read()
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        match_image = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)[:, :, 1:3]
 
         if frame_index < init_frame_index:
             detections.append(None)
@@ -336,24 +461,18 @@ def track_target_with_optical_flow(video_path: Path, config: dict) -> Tuple[List
             prev_gray = gray
             continue
 
-        if frame_index == init_frame_index or points is None or center is None or len(points) < min_tracks:
-            if center is None:
-                center = init_center
-            roi = (
-                int(round(center[0] - init_roi[2] / 2.0)),
-                int(round(center[1] - init_roi[3] / 2.0)),
-                init_roi[2],
-                init_roi[3],
-            )
-            points = detect_features_in_roi(gray, clamp_roi(roi, width, height), config)
+        if quad is None:
+            quad = roi_to_quad(init_roi)
+
+        if frame_index == init_frame_index or points is None or len(points) < min_tracks:
+            reacquired = False
+            if frame_index > init_frame_index:
+                quad, reacquired = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
             prev_gray = gray
-            bbox = (
-                int(round(center[0] - init_roi[2] / 2.0)),
-                int(round(center[1] - init_roi[3] / 2.0)),
-                init_roi[2],
-                init_roi[3],
-            )
-            detections.append(Detection(center, bbox, points.reshape(-1, 2) if points is not None else None))
+            center = quad_center(quad)
+            bbox = bbox_from_quad(quad, width, height)
+            detections.append(Detection(center, bbox, quad.copy(), points.reshape(-1, 2) if points is not None else None))
             centers.append(center)
             continue
 
@@ -374,35 +493,82 @@ def track_target_with_optical_flow(video_path: Path, config: dict) -> Tuple[List
         old_good = points.reshape(-1, 2)[status_mask]
         new_good = next_points.reshape(-1, 2)[status_mask]
         if len(new_good) < min_tracks:
-            detections.append(None)
-            centers.append(None)
             prev_gray = gray
-            points = None
+            quad, _ = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
+            center = quad_center(quad)
+            detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+            centers.append(center)
             continue
 
-        delta = np.median(new_good - old_good, axis=0)
-        if float(np.linalg.norm(delta)) > max_center_jump:
-            detections.append(None)
-            centers.append(None)
-            prev_gray = gray
-            points = None
-            continue
-        center = (float(center[0] + delta[0]), float(center[1] + delta[1]))
-        if center[0] < -init_roi[2] or center[0] > width + init_roi[2] or center[1] < -init_roi[3] or center[1] > height + init_roi[3]:
-            detections.append(None)
-            centers.append(None)
-            prev_gray = gray
-            points = None
-            continue
-        points = new_good.reshape(-1, 1, 2).astype(np.float32)
-        prev_gray = gray
-        bbox = (
-            int(round(center[0] - init_roi[2] / 2.0)),
-            int(round(center[1] - init_roi[3] / 2.0)),
-            init_roi[2],
-            init_roi[3],
+        affine, inliers = cv2.estimateAffinePartial2D(
+            old_good,
+            new_good,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_threshold,
+            maxIters=2000,
+            confidence=0.99,
         )
-        detections.append(Detection(center, bbox, new_good))
+        if affine is None or inliers is None:
+            prev_gray = gray
+            quad, _ = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
+            center = quad_center(quad)
+            detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+            centers.append(center)
+            continue
+
+        inlier_mask = inliers.reshape(-1).astype(bool)
+        if int(inlier_mask.sum()) < min_inliers:
+            prev_gray = gray
+            quad, _ = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
+            center = quad_center(quad)
+            detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+            centers.append(center)
+            continue
+
+        previous_center = np.array(quad_center(quad), dtype=np.float32)
+        next_quad = cv2.transform(quad.reshape(1, 4, 2), affine).reshape(4, 2).astype(np.float32)
+        next_center = np.array(quad_center(next_quad), dtype=np.float32)
+        if float(np.linalg.norm(next_center - previous_center)) > max_center_jump:
+            prev_gray = gray
+            quad, _ = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
+            center = quad_center(quad)
+            detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+            centers.append(center)
+            continue
+
+        if not quad_is_reasonable(next_quad, width, height, initial_area, config):
+            prev_gray = gray
+            quad, _ = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            points = detect_features_in_quad(gray, quad, config)
+            center = quad_center(quad)
+            detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+            centers.append(center)
+            continue
+
+        quad = next_quad
+        if template_check_interval > 0 and frame_index % template_check_interval == 0:
+            reacquired_quad, did_reacquire = maybe_reacquire_quad(match_image, template, quad, init_roi, config)
+            if did_reacquire:
+                quad = reacquired_quad
+                points = detect_features_in_quad(gray, quad, config)
+                prev_gray = gray
+                center = quad_center(quad)
+                detections.append(Detection(center, bbox_from_quad(quad, width, height), quad.copy(), points.reshape(-1, 2) if points is not None else None))
+                centers.append(center)
+                continue
+        points = new_good[inlier_mask].reshape(-1, 1, 2).astype(np.float32)
+        if len(points) < int(config["optical_flow"].get("max_corners", 80)) * 0.4:
+            refreshed = detect_features_in_quad(gray, quad, config)
+            if refreshed is not None and len(refreshed) >= len(points):
+                points = refreshed
+        prev_gray = gray
+        center = quad_center(quad)
+        bbox = bbox_from_quad(quad, width, height)
+        detections.append(Detection(center, bbox, quad.copy(), points.reshape(-1, 2)))
         centers.append(center)
 
     cap.release()
@@ -532,7 +698,7 @@ def process_video(video_path: Path, config: dict, dirs: Dict[str, Path]) -> dict
             cv2.circle(frame, pi, 5, (0, 255, 255), -1)
         if det is not None:
             x, y, w, h = det.bbox
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 80, 0), 2)
+            cv2.polylines(frame, [det.quad.astype(np.int32)], True, (255, 80, 0), 2, cv2.LINE_AA)
             if det.points is not None:
                 for px, py in det.points.reshape(-1, 2):
                     cv2.circle(frame, (int(round(px)), int(round(py))), 2, (0, 255, 0), -1)

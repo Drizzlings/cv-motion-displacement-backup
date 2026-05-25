@@ -61,8 +61,9 @@ def build_markdown_report(rows: List[Dict[str, str]], config: dict, output_path:
         "2. 使用 `cv2.findHomography` 将图像坐标转换到毫米坐标。",
         "3. 用户在初始帧框选运动目标区域。",
         "4. 在目标框内提取 Shi-Tomasi 角点，并使用 Lucas-Kanade 光流逐帧跟踪。",
-        "5. 使用特征点的中位位移更新目标中心。",
-        "6. 将目标中心映射到毫米坐标，计算直线位移和累计路径长度。",
+        "5. 使用 RANSAC 从光流点估计部分仿射变换，更新旋转目标四边形。",
+        "6. 当有效点不足或 ROI 漂移时，使用初始目标的 Lab 色度模板重定位，再在旋转 ROI 内重新提取角点。",
+        "7. 将目标中心映射到毫米坐标，计算直线位移和累计路径长度。",
         "",
         "## 4. 参数设置",
         "",
@@ -73,6 +74,9 @@ def build_markdown_report(rows: List[Dict[str, str]], config: dict, output_path:
         f"- 金字塔层数：`{config['optical_flow']['max_level']}`",
         f"- 最少有效跟踪点：`{config['optical_flow']['min_tracks']}`",
         f"- 最大帧间中心跳变：`{config['optical_flow']['max_center_jump_px']}` 像素",
+        f"- RANSAC 重投影阈值：`{config['optical_flow']['ransac_reproj_threshold']}` 像素",
+        f"- 最少 RANSAC 内点数：`{config['optical_flow']['min_inliers']}`",
+        f"- 模板重定位阈值：`{config['optical_flow']['template_match_threshold']}`",
         f"- 最大物理步长过滤：`{config['quality']['max_world_step_mm']}` mm/帧",
         f"- 平滑窗口：`{config['optical_flow']['smooth_window']}` 帧",
         "",
@@ -115,7 +119,8 @@ def build_docx_report(rows: List[Dict[str, str]], config: dict, output_path: Pat
         "使用 cv2.findHomography 将图像坐标转换到毫米坐标。",
         "用户在初始帧框选运动目标区域。",
         "在目标框内提取 Shi-Tomasi 角点，并使用 Lucas-Kanade 光流逐帧跟踪。",
-        "使用特征点的中位位移更新目标中心。",
+        "使用 RANSAC 从光流点估计部分仿射变换，更新旋转目标四边形。",
+        "当有效点不足或 ROI 漂移时，使用初始目标的 Lab 色度模板重定位，再在旋转 ROI 内重新提取角点。",
         "将目标中心映射到毫米坐标，计算直线位移和累计路径长度。",
     ]:
         doc.add_paragraph(item, style="List Number")
@@ -153,7 +158,7 @@ def build_docx_report(rows: List[Dict[str, str]], config: dict, output_path: Pat
 
     doc.add_heading("6. 说明与局限性", level=1)
     doc.add_paragraph("当前数据集中没有人工标注的真实位移，因此本报告不计算误差百分比。若后续提供真实位移，可追加误差统计。")
-    doc.add_paragraph("标定精度依赖手动点击的角点和内框真实尺寸；光流跟踪依赖初始目标框和可跟踪角点质量。若相机发生移动或目标离开标定平面，测量结果会产生误差。")
+    doc.add_paragraph("标定精度依赖手动点击的角点和内框真实尺寸；光流跟踪依赖初始目标框、RANSAC 内点质量和模板重定位效果。若相机发生移动或目标离开标定平面，测量结果会产生误差。")
     doc.save(output_path)
 
 
