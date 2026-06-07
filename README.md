@@ -52,14 +52,8 @@ E:\anaconda\envs\cv\python.exe src\motion_displacement.py --remark --video 1.mp4
 - `output/plots/*_displacement.png`：位移随时间变化曲线。
 - `output/calibration/*_calibration.jpg`：用户标定四点可视化结果。
 - `output/results.csv`：每段视频的统计结果。
-- `output/report.md`：解释文档。
-- `output/report.docx`：Word 版解释文档。
 
-报告由独立程序生成：
 
-```powershell
-E:\anaconda\envs\cv\python.exe src\generate_report.py
-```
 
 ## 方法概述
 
@@ -71,6 +65,3 @@ E:\anaconda\envs\cv\python.exe src\generate_report.py
 6. 当有效点不足或 ROI 漂移时，使用初始目标的 Lab 色度模板重定位，再重新提取 LK 跟踪点。
 7. 将像素坐标转换为毫米坐标，计算相对起点的直线位移和累计路径长度。
 
-## 说明
-
-当前数据没有人工标注的真实位移，因此程序只输出测量值，不计算误差百分比。若后续提供每段视频的真实位移，可在 `results.csv` 基础上追加误差统计。
